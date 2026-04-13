@@ -8,16 +8,17 @@ Run:
     streamlit run au4_landmark_viewer.py
 
 Install:
-    pip install streamlit opencv-python mediapipe Pillow numpy
+    pip install streamlit mediapipe Pillow numpy
 """
 
 import os
+import io
 import numpy as np
-import cv2
 import streamlit as st
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
+from PIL import Image, ImageDraw, ImageFont
 
 # ---------------------------------------------------------------------------
 # Landmark index groups  (MediaPipe 478-point canonical face mesh)
@@ -40,24 +41,17 @@ LEFT_OUTER_EYE_CORNER  = 263
 AU4_CROP_INDICES = RIGHT_EYEBROW + LEFT_EYEBROW + RIGHT_INNER_BROW + LEFT_INNER_BROW
 
 # ---------------------------------------------------------------------------
-# Drawing constants  (BGR colour palette for OpenCV)
+# Drawing constants  (RGB colour palette for Pillow)
 # ---------------------------------------------------------------------------
-C_RIGHT_BROW   = (0,   255, 255)   # yellow
-C_LEFT_BROW    = (0,   165, 255)   # orange
-C_RIGHT_EYE    = (255,   0,   0)   # blue
-C_LEFT_EYE     = (180,   0, 200)   # purple
-C_INNER_BROW   = (0,     0, 255)   # red  (AU4 core)
-C_OUTLINE      = (0,     0,   0)   # black outline ring
-C_WHITE        = (255, 255, 255)
-C_BLACK        = (0,   0,   0)
+C_RIGHT_BROW = (255, 255,   0)   # yellow
+C_LEFT_BROW  = (255, 165,   0)   # orange
+C_RIGHT_EYE  = (  0,   0, 255)   # blue
+C_LEFT_EYE   = (200,   0, 180)   # purple
+C_INNER_BROW = (255,   0,   0)   # red  (AU4 core)
+C_OUTLINE    = (  0,   0,   0)   # black
+C_WHITE      = (255, 255, 255)
+C_DARK_BG    = ( 25,  25,  35)
 
-FONT            = cv2.FONT_HERSHEY_SIMPLEX
-FONT_SCALE_LBL  = 0.40
-FONT_SCALE_LEG  = 0.50
-FONT_SCALE_INFO = 0.55
-THICK_LINE      = 2
-THICK_TEXT      = 1
-THICK_TEXT_BOLD = 2
 DOT_RADIUS      = 5
 DOT_RADIUS_CORE = 8
 LINE_THICKNESS  = 2
@@ -66,6 +60,16 @@ MODEL_DOWNLOAD_URL = (
     "https://storage.googleapis.com/mediapipe-models/"
     "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 )
+
+# Load fonts (Pillow 10+ supports load_default(size=N))
+try:
+    FONT_LABEL  = ImageFont.load_default(size=12)
+    FONT_LEGEND = ImageFont.load_default(size=14)
+    FONT_INFO   = ImageFont.load_default(size=15)
+    FONT_TITLE  = ImageFont.load_default(size=17)
+except TypeError:
+    _f = ImageFont.load_default()
+    FONT_LABEL = FONT_LEGEND = FONT_INFO = FONT_TITLE = _f
 
 # ---------------------------------------------------------------------------
 # Helper – run MediaPipe Face Landmarker (Tasks API)
@@ -114,45 +118,37 @@ def lm_px(lm, w: int, h: int):
 # ---------------------------------------------------------------------------
 # Helper – draw a landmark group with connecting polyline + optional labels
 # ---------------------------------------------------------------------------
-def _draw_group(canvas, landmarks, indices, color,
+def _draw_group(draw: ImageDraw.ImageDraw, img_w: int, img_h: int,
+                landmarks, indices, color,
                 radius: int = DOT_RADIUS, label: bool = False,
                 connect: bool = True):
-    ch, cw = canvas.shape[:2]
-    pts = []
-    for idx in indices:
-        lm     = landmarks[idx]
-        px, py = lm_px(lm, cw, ch)
-        pts.append((px, py))
+    pts = [lm_px(landmarks[i], img_w, img_h) for i in indices]
 
-    # connecting polyline (drawn first, underneath the dots)
     if connect and len(pts) > 1:
         for i in range(len(pts) - 1):
-            cv2.line(canvas, pts[i], pts[i + 1], color, LINE_THICKNESS, cv2.LINE_AA)
+            draw.line([pts[i], pts[i + 1]], fill=color, width=LINE_THICKNESS)
 
-    # dots + optional labels
     for i, idx in enumerate(indices):
         px, py = pts[i]
-        # black outline for contrast
-        cv2.circle(canvas, (px, py), radius + 2, C_OUTLINE, -1)
-        # coloured filled dot
-        cv2.circle(canvas, (px, py), radius, color, -1)
+        r = radius
+        draw.ellipse([(px-r-2, py-r-2), (px+r+2, py+r+2)], fill=C_OUTLINE)
+        draw.ellipse([(px-r,   py-r),   (px+r,   py+r)],   fill=color)
+
         if label:
-            # semi-transparent dark background behind the label text
-            text     = str(idx)
-            (tw, th), _ = cv2.getTextSize(text, FONT, FONT_SCALE_LBL, THICK_TEXT)
-            tx, ty   = px + radius + 2, py - radius - 2
-            cv2.rectangle(canvas,
-                          (tx - 1, ty - th - 1),
-                          (tx + tw + 1, ty + 2),
-                          C_OUTLINE, -1)
-            cv2.putText(canvas, text, (tx, ty),
-                        FONT, FONT_SCALE_LBL, C_WHITE, THICK_TEXT, cv2.LINE_AA)
+            text = str(idx)
+            bbox = draw.textbbox((0, 0), text, font=FONT_LABEL)
+            tw   = bbox[2] - bbox[0]
+            th   = bbox[3] - bbox[1]
+            tx   = px + r + 3
+            ty   = py - r - th - 3
+            draw.rectangle([(tx-1, ty-1), (tx+tw+1, ty+th+1)], fill=C_OUTLINE)
+            draw.text((tx, ty), text, fill=C_WHITE, font=FONT_LABEL)
 
 
 # ---------------------------------------------------------------------------
 # Helper – draw legend with a filled background box
 # ---------------------------------------------------------------------------
-def _draw_legend(canvas):
+def _draw_legend(image_rgb: np.ndarray) -> np.ndarray:
     items = [
         (C_RIGHT_BROW, "Right eyebrow"),
         (C_LEFT_BROW,  "Left eyebrow"),
@@ -160,88 +156,75 @@ def _draw_legend(canvas):
         (C_LEFT_EYE,   "Left eye (ref)"),
         (C_INNER_BROW, "Inner brow – AU4 core"),
     ]
-    ch, cw   = canvas.shape[:2]
-    row_h    = 22
-    pad      = 8
-    swatch_w = 16
-    swatch_h = 12
+    ih, iw = image_rgb.shape[:2]
+    pil_img = Image.fromarray(image_rgb)
 
-    # Measure the widest label to size the background box
-    max_text_w = 0
-    for _, text in items:
-        (tw, _), _ = cv2.getTextSize(text, FONT, FONT_SCALE_LEG, THICK_TEXT)
-        max_text_w  = max(max_text_w, tw)
+    # Measure widest label first
+    tmp_draw = ImageDraw.Draw(pil_img)
+    max_tw   = max(tmp_draw.textbbox((0, 0), t, font=FONT_LEGEND)[2] for _, t in items)
 
-    box_w = pad + swatch_w + pad + max_text_w + pad
+    row_h = 24
+    pad   = 8
+    sw    = 16
+    sh    = 12
+    box_w = pad + sw + pad + max_tw + pad
     box_h = pad + len(items) * row_h + pad
+    x0    = 10
+    y0    = ih - box_h - 10
 
-    # Place legend in bottom-left so it doesn't cover the face
-    x0 = 10
-    y0 = ch - box_h - 10
+    # Semi-transparent dark background via blend
+    overlay      = pil_img.copy()
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.rectangle([(x0, y0), (x0 + box_w, y0 + box_h)], fill=(30, 30, 30))
+    pil_img = Image.blend(pil_img, overlay, alpha=0.75)
 
-    # Semi-dark filled background
-    overlay = canvas.copy()
-    cv2.rectangle(overlay, (x0, y0), (x0 + box_w, y0 + box_h), (30, 30, 30), -1)
-    cv2.addWeighted(overlay, 0.75, canvas, 0.25, 0, canvas)
-
+    draw = ImageDraw.Draw(pil_img)
     for i, (color, text) in enumerate(items):
-        row_y  = y0 + pad + i * row_h
-        sw_x1  = x0 + pad
-        sw_y1  = row_y + 2
-        sw_x2  = sw_x1 + swatch_w
-        sw_y2  = sw_y1 + swatch_h
-        cv2.rectangle(canvas, (sw_x1, sw_y1), (sw_x2, sw_y2), color, -1)
-        cv2.rectangle(canvas, (sw_x1, sw_y1), (sw_x2, sw_y2), C_OUTLINE, 1)
-        cv2.putText(canvas, text,
-                    (sw_x2 + pad, row_y + swatch_h),
-                    FONT, FONT_SCALE_LEG, C_WHITE, THICK_TEXT, cv2.LINE_AA)
+        row_y = y0 + pad + i * row_h
+        draw.rectangle([(x0+pad, row_y+2), (x0+pad+sw, row_y+2+sh)],
+                       fill=color, outline=C_OUTLINE)
+        draw.text((x0 + pad + sw + pad, row_y + 2), text,
+                  fill=C_WHITE, font=FONT_LEGEND)
+
+    return np.array(pil_img)
 
 
 # ---------------------------------------------------------------------------
-# Core – draw all AU4-relevant landmarks on a copy of image_bgr
+# Core – draw all AU4-relevant landmarks on a copy of image_rgb
 # ---------------------------------------------------------------------------
-def draw_au4_landmarks(image_bgr: np.ndarray, landmarks) -> np.ndarray:
-    """
-    Return an annotated BGR copy with:
-      - eye reference landmarks (no labels)
-      - eyebrow landmarks with index labels and connecting lines
-      - inner brow (AU4 core) highlighted in red on top
-      - legend in the bottom-left corner
-    """
-    canvas = image_bgr.copy()
+def draw_au4_landmarks(image_rgb: np.ndarray, landmarks) -> np.ndarray:
+    """Return an annotated RGB copy."""
+    pil_img = Image.fromarray(image_rgb.copy())
+    draw    = ImageDraw.Draw(pil_img)
+    ih, iw  = image_rgb.shape[:2]
 
-    # Eye reference (background layer, no labels, no connect)
-    _draw_group(canvas, landmarks, RIGHT_EYE, C_RIGHT_EYE,
+    _draw_group(draw, iw, ih, landmarks, RIGHT_EYE, C_RIGHT_EYE,
                 radius=3, label=False, connect=True)
-    _draw_group(canvas, landmarks, LEFT_EYE,  C_LEFT_EYE,
+    _draw_group(draw, iw, ih, landmarks, LEFT_EYE, C_LEFT_EYE,
                 radius=3, label=False, connect=True)
-
-    # Eyebrow arches – labelled, with connecting line
-    _draw_group(canvas, landmarks, RIGHT_EYEBROW, C_RIGHT_BROW,
+    _draw_group(draw, iw, ih, landmarks, RIGHT_EYEBROW, C_RIGHT_BROW,
                 radius=DOT_RADIUS, label=True, connect=True)
-    _draw_group(canvas, landmarks, LEFT_EYEBROW,  C_LEFT_BROW,
+    _draw_group(draw, iw, ih, landmarks, LEFT_EYEBROW, C_LEFT_BROW,
                 radius=DOT_RADIUS, label=True, connect=True)
-
-    # Inner brow AU4 core – larger dots, drawn on top
-    _draw_group(canvas, landmarks, RIGHT_INNER_BROW, C_INNER_BROW,
+    _draw_group(draw, iw, ih, landmarks, RIGHT_INNER_BROW, C_INNER_BROW,
                 radius=DOT_RADIUS_CORE, label=True, connect=True)
-    _draw_group(canvas, landmarks, LEFT_INNER_BROW,  C_INNER_BROW,
+    _draw_group(draw, iw, ih, landmarks, LEFT_INNER_BROW, C_INNER_BROW,
                 radius=DOT_RADIUS_CORE, label=True, connect=True)
 
-    _draw_legend(canvas)
-    return canvas
+    annotated = np.array(pil_img)
+    return _draw_legend(annotated)
 
 
 # ---------------------------------------------------------------------------
 # Core – crop the AU4 region (eyebrow + glabella) with padding
 # ---------------------------------------------------------------------------
-def crop_au4_region(image_bgr: np.ndarray, landmarks,
+def crop_au4_region(image_rgb: np.ndarray, landmarks,
                     pad_frac: float = 0.35) -> np.ndarray:
     """
-    Return a tightly-padded BGR crop of the brow/glabella region.
+    Return a tightly-padded RGB crop of the brow/glabella region.
     pad_frac: fractional padding relative to bounding-box size.
     """
-    h, w = image_bgr.shape[:2]
+    h, w = image_rgb.shape[:2]
     xs = [int(landmarks[i].x * w) for i in AU4_CROP_INDICES]
     ys = [int(landmarks[i].y * h) for i in AU4_CROP_INDICES]
 
@@ -259,7 +242,7 @@ def crop_au4_region(image_bgr: np.ndarray, landmarks,
     cx2 = min(x_max + pad_x, w)
     cy2 = min(y_max + pad_y, h)
 
-    return image_bgr[cy1:cy2, cx1:cx2].copy()
+    return image_rgb[cy1:cy2, cx1:cx2].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -316,9 +299,9 @@ def _resize_to_height(img: np.ndarray, target_h: int) -> np.ndarray:
     h, w = img.shape[:2]
     if h == 0:
         return img
-    scale  = target_h / h
-    new_w  = max(1, int(w * scale))
-    return cv2.resize(img, (new_w, target_h), interpolation=cv2.INTER_AREA)
+    scale = target_h / h
+    new_w = max(1, int(w * scale))
+    return np.array(Image.fromarray(img).resize((new_w, target_h), Image.LANCZOS))
 
 
 # ---------------------------------------------------------------------------
@@ -326,51 +309,44 @@ def _resize_to_height(img: np.ndarray, target_h: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 def _make_text_panel(measurements: dict, img_w: int, img_h: int,
                      num_faces: int, panel_h: int, panel_w: int) -> np.ndarray:
-    panel = np.zeros((panel_h, panel_w, 3), dtype=np.uint8)
-    panel[:] = (25, 25, 35)   # very dark blue-black background
+    panel = Image.new("RGB", (panel_w, panel_h), color=C_DARK_BG)
+    draw  = ImageDraw.Draw(panel)
 
     m     = measurements
     lines = [
-        ("AU4 Geometric Measurements", True),
-        ("", False),
-        (f"Image size          : {img_w} x {img_h} px", False),
-        (f"Faces detected      : {num_faces}", False),
-        ("", False),
-        (f"Right brow-eye dist : {m['right_brow_eye_dist_px']:6.1f} px"
-         f"  ({m['right_brow_eye_dist_norm']:.4f} norm)", False),
-        (f"Left  brow-eye dist : {m['left_brow_eye_dist_px']:6.1f} px"
-         f"  ({m['left_brow_eye_dist_norm']:.4f} norm)", False),
-        (f"Mean  brow-eye dist : {m['mean_brow_eye_dist_px']:6.1f} px"
-         f"  ({m['mean_brow_eye_dist_norm']:.4f} norm)", False),
-        (f"Inner brow gap      : {m['inner_brow_gap_px']:6.1f} px"
-         f"  ({m['inner_brow_gap_norm']:.4f} norm)", False),
-        ("", False),
-        (f"Face width ref.     : {m['face_width_px']:6.1f} px", False),
-        ("", False),
-        ("Lower brow-eye dist = stronger AU4 activation.", False),
+        ("AU4 Geometric Measurements",                                               FONT_TITLE, (220, 220, 100)),
+        ("",                                                                          FONT_INFO,  C_WHITE),
+        (f"Image size          : {img_w} x {img_h} px",                             FONT_INFO,  C_WHITE),
+        (f"Faces detected      : {num_faces}",                                       FONT_INFO,  C_WHITE),
+        ("",                                                                          FONT_INFO,  C_WHITE),
+        (f"Right brow-eye dist : {m['right_brow_eye_dist_px']:6.1f} px  ({m['right_brow_eye_dist_norm']:.4f} norm)", FONT_INFO, C_WHITE),
+        (f"Left  brow-eye dist : {m['left_brow_eye_dist_px']:6.1f} px  ({m['left_brow_eye_dist_norm']:.4f} norm)",  FONT_INFO, C_WHITE),
+        (f"Mean  brow-eye dist : {m['mean_brow_eye_dist_px']:6.1f} px  ({m['mean_brow_eye_dist_norm']:.4f} norm)",  FONT_INFO, C_WHITE),
+        (f"Inner brow gap      : {m['inner_brow_gap_px']:6.1f} px  ({m['inner_brow_gap_norm']:.4f} norm)",          FONT_INFO, C_WHITE),
+        ("",                                                                          FONT_INFO,  C_WHITE),
+        (f"Face width ref.     : {m['face_width_px']:6.1f} px",                     FONT_INFO,  C_WHITE),
+        ("",                                                                          FONT_INFO,  C_WHITE),
+        ("Lower brow-eye dist = stronger AU4 activation.",                           FONT_INFO,  (180, 220, 255)),
     ]
 
-    y = 30
+    y  = 25
     dy = 28
-    for text, bold in lines:
+    for text, font, color in lines:
         if not text:
             y += dy // 2
             continue
-        thick = THICK_TEXT_BOLD if bold else THICK_TEXT
-        scale = FONT_SCALE_INFO * (1.1 if bold else 1.0)
-        color = (220, 220, 100) if bold else C_WHITE
-        cv2.putText(panel, text, (20, y), FONT, scale, color, thick, cv2.LINE_AA)
+        draw.text((20, y), text, fill=color, font=font)
         y += dy
 
-    return panel
+    return np.array(panel)
 
 
 # ---------------------------------------------------------------------------
 # Helper – assemble the final combined output panel
 # ---------------------------------------------------------------------------
-def make_combined_panel(image_bgr: np.ndarray,
-                        annotated_bgr: np.ndarray,
-                        crop_bgr: np.ndarray,
+def make_combined_panel(image_rgb: np.ndarray,
+                        annotated_rgb: np.ndarray,
+                        crop_rgb: np.ndarray,
                         measurements: dict,
                         img_h: int, img_w: int,
                         num_faces: int,
@@ -381,8 +357,8 @@ def make_combined_panel(image_bgr: np.ndarray,
       Row 2 (side-by-side): AU4 crop | measurement text panel
     Returns a single BGR image.
     """
-    orig_r  = _resize_to_height(image_bgr,   target_row_h)
-    anno_r  = _resize_to_height(annotated_bgr, target_row_h)
+    orig_r  = _resize_to_height(image_rgb,     target_row_h)
+    anno_r  = _resize_to_height(annotated_rgb, target_row_h)
 
     # Row 1: original + overlay, same height
     divider_v = np.full((target_row_h, 6, 3), 180, dtype=np.uint8)
@@ -392,7 +368,7 @@ def make_combined_panel(image_bgr: np.ndarray,
 
     # Row 2: crop + text panel
     crop_h       = target_row_h
-    crop_resized = _resize_to_height(crop_bgr, crop_h)
+    crop_resized = _resize_to_height(crop_rgb, crop_h)
     crop_w_actual = crop_resized.shape[1]
 
     text_w = max(total_w - crop_w_actual - 6, 200)
@@ -481,15 +457,14 @@ def main():
     # ------------------------------------------------------------------
     # Decode image
     # ------------------------------------------------------------------
-    file_bytes = np.frombuffer(uploaded_file.read(), np.uint8)
-    image_bgr  = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-    if image_bgr is None:
-        st.error("Failed to decode the uploaded image. Please try another file.")
+    try:
+        pil_img   = Image.open(io.BytesIO(uploaded_file.read())).convert("RGB")
+        image_rgb = np.array(pil_img)
+    except Exception as exc:
+        st.error(f"Failed to decode the uploaded image: {exc}")
         return
 
-    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-    h, w      = image_bgr.shape[:2]
+    h, w = image_rgb.shape[:2]
 
     # ------------------------------------------------------------------
     # Validate model path before running
@@ -542,8 +517,8 @@ def main():
     # ------------------------------------------------------------------
     # Annotate + crop + measure
     # ------------------------------------------------------------------
-    annotated_bgr = draw_au4_landmarks(image_bgr, landmarks)
-    au4_crop_bgr  = crop_au4_region(annotated_bgr, landmarks)
+    annotated_rgb = draw_au4_landmarks(image_rgb, landmarks)
+    au4_crop_rgb  = crop_au4_region(annotated_rgb, landmarks)
     measurements  = compute_au4_measurements(landmarks, w, h)
 
     # ------------------------------------------------------------------
@@ -556,15 +531,14 @@ def main():
         st.image(image_rgb, use_column_width=True)
     with col_anno:
         st.subheader("AU4 Landmarks Overlay")
-        st.image(cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB),
-                 use_column_width=True)
+        st.image(annotated_rgb, use_column_width=True)
 
     # ------------------------------------------------------------------
     # Row 2: AU4 brow/glabella crop (below the two columns)
     # ------------------------------------------------------------------
     st.markdown("---")
     st.subheader("AU4 Region – Eyebrow & Glabella Zoom")
-    st.image(cv2.cvtColor(au4_crop_bgr, cv2.COLOR_BGR2RGB),
+    st.image(au4_crop_rgb,
              caption="Zoomed crop: eyebrows + inner brow (AU4 core) region",
              use_column_width=False)
 
@@ -614,11 +588,11 @@ def main():
     # Save combined output panel
     # ------------------------------------------------------------------
     panel = make_combined_panel(
-        image_bgr, annotated_bgr, au4_crop_bgr,
+        image_rgb, annotated_rgb, au4_crop_rgb,
         measurements, h, w, num_faces,
     )
     try:
-        cv2.imwrite(output_path, panel)
+        Image.fromarray(panel).save(output_path)
         st.success(f"Combined analysis panel saved → `{output_path}`")
     except Exception as exc:
         st.warning(f"Could not save output image: {exc}")
