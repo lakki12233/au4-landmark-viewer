@@ -82,7 +82,10 @@ def run_face_landmarker(image_rgb: np.ndarray, model_path: str):
             f"Download it from:\n{MODEL_DOWNLOAD_URL}"
         )
 
-    base_opts = mp_python.BaseOptions(model_asset_path=model_path)
+    base_opts = mp_python.BaseOptions(
+        model_asset_path=model_path,
+        delegate=mp_python.BaseOptions.Delegate.CPU,
+    )
     options   = mp_vision.FaceLandmarkerOptions(
         base_options=base_opts,
         output_face_blendshapes=False,
